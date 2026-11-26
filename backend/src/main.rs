@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
+use chrono::{DateTime, FixedOffset, Months, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{
@@ -62,16 +62,23 @@ fn timestamp(s: &str) -> Result<String, ApiError> {
 }
 
 fn payment_request_hash(payment: &Payment) -> String {
-    let payload = serde_json::json!([
-        payment.member,
-        payment.description,
-        payment.category,
-        payment.method,
-        payment.amount,
-        payment.status,
-        payment.occurred_at
-    ]);
-    format!("{:x}", Sha256::digest(payload.to_string().as_bytes()))
+    let mut payload = vec![
+        serde_json::json!(payment.member),
+        serde_json::json!(payment.description),
+        serde_json::json!(payment.category),
+        serde_json::json!(payment.method),
+        serde_json::json!(payment.amount),
+        serde_json::json!(payment.status),
+        serde_json::json!(payment.occurred_at),
+    ];
+    // Preserve the hash for requests saved before membership months were added.
+    if let Some(months) = payment.membership_months {
+        payload.push(serde_json::json!(months));
+    }
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::Value::Array(payload).to_string().as_bytes())
+    )
 }
 
 fn request_conflict() -> ApiError {
@@ -88,6 +95,7 @@ struct Payment {
     member: String,
     description: String,
     category: String,
+    membership_months: Option<i64>,
     method: String,
     amount: i64,
     status: String,
@@ -110,6 +118,7 @@ struct Filters {
     status: Option<String>,
     q: Option<String>,
     page: Option<usize>,
+    expired_memberships: Option<bool>,
 }
 impl Filters {
     fn validate(&self) -> Result<(), ApiError> {
@@ -177,10 +186,16 @@ async fn auth(State(s): State<App>, req: Request, next: Next) -> Response {
         (StatusCode::UNAUTHORIZED, "Phiên truy cập không hợp lệ.").into_response()
     }
 }
-async fn data(s: &App, f: &Filters) -> Result<(Vec<Payment>, Vec<Refund>), ApiError> {
+struct FilteredTransactions {
+    payments: Vec<Payment>,
+    refunds: Vec<Refund>,
+    refunded_by_transaction: BTreeMap<String, i64>,
+}
+
+async fn data(s: &App, f: &Filters) -> Result<FilteredTransactions, ApiError> {
     f.validate()?;
     let mut snapshot = s.db.begin().await.map_err(db_error)?;
-    let all=sqlx::query_as::<_,Payment>("SELECT id,member,description,category,method,amount,status,occurred_at FROM transactions ORDER BY occurred_at DESC,id").fetch_all(&mut *snapshot).await.map_err(db_error)?;
+    let all=sqlx::query_as::<_,Payment>("SELECT id,member,description,category,membership_months,method,amount,status,occurred_at FROM transactions ORDER BY occurred_at DESC,id").fetch_all(&mut *snapshot).await.map_err(db_error)?;
     let refunds = sqlx::query_as::<_, Refund>(
         "SELECT id,transaction_id,amount,reason,occurred_at FROM refunds ORDER BY occurred_at DESC",
     )
@@ -189,23 +204,100 @@ async fn data(s: &App, f: &Filters) -> Result<(Vec<Payment>, Vec<Refund>), ApiEr
     .map_err(db_error)?;
     snapshot.commit().await.map_err(db_error)?;
     let matched: Vec<_> = all.into_iter().filter(|p| f.matches(p)).collect();
+    let mut refunded_by_transaction = BTreeMap::new();
+    for refund in &refunds {
+        *refunded_by_transaction
+            .entry(refund.transaction_id.clone())
+            .or_default() += refund.amount;
+    }
     let refunds = refunds
         .into_iter()
         .filter(|r| f.date(&r.occurred_at) && matched.iter().any(|p| p.id == r.transaction_id))
         .collect();
-    Ok((
-        matched
+    Ok(FilteredTransactions {
+        payments: matched
             .into_iter()
             .filter(|p| f.date(&p.occurred_at))
             .collect(),
         refunds,
-    ))
+        refunded_by_transaction,
+    })
 }
+#[derive(Serialize)]
+struct OverviewItem {
+    #[serde(flatten)]
+    payment: Payment,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_on: Option<NaiveDate>,
+    refunded_amount: i64,
+}
+
+async fn expired_memberships(
+    db: &SqlitePool,
+    query: Option<&str>,
+    today: NaiveDate,
+) -> Result<Vec<OverviewItem>, ApiError> {
+    let payments = sqlx::query_as::<_, Payment>(
+        "SELECT id,member,description,category,membership_months,method,amount,status,occurred_at
+         FROM transactions
+         WHERE category='membership' AND status='paid' AND membership_months IS NOT NULL
+         ORDER BY occurred_at DESC,id",
+    )
+    .fetch_all(db)
+    .await
+    .map_err(db_error)?;
+    let mut memberships = BTreeMap::new();
+    for payment in payments {
+        let (Some(start), Some(months)) =
+            (local_date(&payment.occurred_at), payment.membership_months)
+        else {
+            continue;
+        };
+        if start > today {
+            continue;
+        }
+        let end = u32::try_from(months)
+            .ok()
+            .and_then(|months| start.checked_add_months(Months::new(months)))
+            .unwrap_or(NaiveDate::MAX);
+        let member = payment.member.trim().to_lowercase();
+        if memberships
+            .get(&member)
+            .is_none_or(|(previous, _)| end > *previous)
+        {
+            memberships.insert(member, (end, payment));
+        }
+    }
+    let search = Filters {
+        q: query.map(str::to_owned),
+        ..Filters::default()
+    };
+    let mut items: Vec<_> = memberships
+        .into_values()
+        .filter(|(end, payment)| *end <= today && search.matches(payment))
+        .map(|(end, payment)| OverviewItem {
+            payment,
+            expires_on: Some(end),
+            refunded_amount: 0,
+        })
+        .collect();
+    items.sort_by(|a, b| {
+        b.expires_on
+            .cmp(&a.expires_on)
+            .then_with(|| a.payment.member.cmp(&b.payment.member))
+    });
+    Ok(items)
+}
+
 async fn overview(
     State(s): State<App>,
     Query(f): Query<Filters>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (payments, refunds) = data(&s, &f).await?;
+    let FilteredTransactions {
+        payments,
+        refunds,
+        refunded_by_transaction,
+    } = data(&s, &f).await?;
     let gross: i64 = payments
         .iter()
         .filter(|p| p.status == "paid")
@@ -226,16 +318,37 @@ async fn overview(
             daily.entry(date).or_default().1 += r.amount;
         }
     }
-    let total = payments.len();
+    let show_expired = f.expired_memberships.unwrap_or(false);
+    let items = if show_expired {
+        let today = local_date(&now()).ok_or_else(|| bad("Không thể xác định ngày hiện tại."))?;
+        expired_memberships(&s.db, f.q.as_deref(), today).await?
+    } else {
+        payments
+            .into_iter()
+            .map(|payment| OverviewItem {
+                payment,
+                expires_on: None,
+                refunded_amount: 0,
+            })
+            .collect()
+    };
+    let total = items.len();
     let pages = total.div_ceil(10).max(1);
     let page = f.page.unwrap_or(1).clamp(1, pages);
-    let items: Vec<_> = payments
+    let items: Vec<_> = items
         .into_iter()
         .skip((page - 1) * 10)
         .take(10)
+        .map(|mut item| {
+            item.refunded_amount = refunded_by_transaction
+                .get(&item.payment.id)
+                .copied()
+                .unwrap_or_default();
+            item
+        })
         .collect();
     Ok(Json(
-        serde_json::json!({"gross":gross,"refunded":refunded,"net":gross-refunded,"count":count,"daily":daily.into_iter().map(|(date,(income,refund))|serde_json::json!({"date":date,"income":income,"refund":refund})).collect::<Vec<_>>(),"categories":categories,"items":items,"total":total,"page":page,"pages":pages}),
+        serde_json::json!({"gross":gross,"refunded":refunded,"net":gross-refunded,"count":count,"daily":daily.into_iter().map(|(date,(income,refund))|serde_json::json!({"date":date,"income":income,"refund":refund})).collect::<Vec<_>>(),"categories":categories,"items":items,"total":total,"page":page,"pages":pages,"expired_memberships":show_expired}),
     ))
 }
 #[derive(Deserialize)]
@@ -243,6 +356,7 @@ struct NewPayment {
     member: String,
     description: String,
     category: String,
+    membership_months: Option<i64>,
     method: String,
     amount: i64,
     status: String,
@@ -266,6 +380,13 @@ async fn create(
     {
         return Err(bad("Vui lòng kiểm tra nội dung và số tiền khoản thu."));
     }
+    if p.membership_months
+        .is_some_and(|months| months <= 0 || p.category != "membership")
+    {
+        return Err(bad(
+            "Tổng tháng phải là số nguyên dương và chỉ áp dụng cho gói hội viên.",
+        ));
+    }
     let date = timestamp(&p.occurred_at)?;
     if p.status == "paid" && date > now() {
         return Err(bad("Thời điểm khoản đã thu không được ở tương lai."));
@@ -276,13 +397,14 @@ async fn create(
         member: p.member.trim().to_owned(),
         description: p.description.trim().to_owned(),
         category: p.category,
+        membership_months: p.membership_months,
         method: p.method,
         amount: p.amount,
         status: p.status,
         occurred_at: date,
     };
     let request_hash = payment_request_hash(&payment);
-    let inserted = sqlx::query("INSERT INTO transactions VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(idempotency_key) DO NOTHING")
+    let inserted = sqlx::query("INSERT INTO transactions(id,member,description,category,method,amount,status,occurred_at,idempotency_key,membership_months) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(idempotency_key) DO NOTHING")
         .bind(&payment.id)
         .bind(&payment.member)
         .bind(&payment.description)
@@ -292,6 +414,7 @@ async fn create(
         .bind(&payment.status)
         .bind(&payment.occurred_at)
         .bind(&p.idempotency_key)
+        .bind(payment.membership_months)
         .execute(&mut *tx)
         .await
         .map_err(db_error)?
@@ -315,7 +438,7 @@ async fn create(
         .map_err(db_error)?;
     } else {
         let existing = sqlx::query_as::<_, Payment>(
-            "SELECT id,member,description,category,method,amount,status,occurred_at FROM transactions WHERE idempotency_key=?",
+            "SELECT id,member,description,category,membership_months,method,amount,status,occurred_at FROM transactions WHERE idempotency_key=?",
         )
         .bind(&p.idempotency_key)
         .fetch_one(&mut *tx)
@@ -339,7 +462,7 @@ async fn detail(
     State(s): State<App>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let p=sqlx::query_as::<_,Payment>("SELECT id,member,description,category,method,amount,status,occurred_at FROM transactions WHERE id=?").bind(&id).fetch_optional(&s.db).await.map_err(db_error)?.ok_or((StatusCode::NOT_FOUND,"Không tìm thấy giao dịch.".into()))?;
+    let p=sqlx::query_as::<_,Payment>("SELECT id,member,description,category,membership_months,method,amount,status,occurred_at FROM transactions WHERE id=?").bind(&id).fetch_optional(&s.db).await.map_err(db_error)?.ok_or((StatusCode::NOT_FOUND,"Không tìm thấy giao dịch.".into()))?;
     let refunds=sqlx::query_as::<_,Refund>("SELECT id,transaction_id,amount,reason,occurred_at FROM refunds WHERE transaction_id=? ORDER BY occurred_at DESC").bind(id).fetch_all(&s.db).await.map_err(db_error)?;
     Ok(Json(serde_json::json!({"payment":p,"refunds":refunds})))
 }
@@ -446,7 +569,9 @@ fn cell(s: &str) -> String {
     format!("\"{}\"", safe.replace('"', "\"\""))
 }
 async fn export(State(s): State<App>, Query(f): Query<Filters>) -> Result<Response, ApiError> {
-    let (payments, refunds) = data(&s, &f).await?;
+    let FilteredTransactions {
+        payments, refunds, ..
+    } = data(&s, &f).await?;
     let mut csv="\u{feff}Loại,Mã phiếu,Hội viên,Nội dung,Nguồn thu,Phương thức,Trạng thái,Số tiền VND,Thời điểm UTC\r\n".to_string();
     for p in payments {
         csv.push_str(
@@ -598,7 +723,7 @@ async fn seed(db: &SqlitePool) {
         let (cat, desc, amount) = cats[i % 4];
         let date = (Utc::now() - chrono::Duration::days((i % 25) as i64))
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        sqlx::query("INSERT OR IGNORE INTO transactions VALUES(?,?,?,?,?,?,?,?,?)")
+        sqlx::query("INSERT OR IGNORE INTO transactions(id,member,description,category,method,amount,status,occurred_at,idempotency_key) VALUES(?,?,?,?,?,?,?,?,?)")
             .bind(format!("TA-DEMO-{i:03}"))
             .bind(names[i % 6])
             .bind(desc)

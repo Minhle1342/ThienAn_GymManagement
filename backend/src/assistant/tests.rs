@@ -12,7 +12,7 @@ async fn app() -> App {
 }
 
 async fn payment(db: &SqlitePool, id: &str, status: &str, at: &str, amount: i64) {
-    sqlx::query("INSERT INTO transactions VALUES(?, 'Tên riêng', 'Thông tin riêng', 'membership', 'cash', ?, ?, ?, ?)")
+    sqlx::query("INSERT INTO transactions(id,member,description,category,method,amount,status,occurred_at,idempotency_key) VALUES(?, 'Tên riêng', 'Thông tin riêng', 'membership', 'cash', ?, ?, ?, ?)")
         .bind(id).bind(amount).bind(status).bind(at).bind(id).execute(db).await.unwrap();
 }
 

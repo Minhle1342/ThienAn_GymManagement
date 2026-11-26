@@ -65,6 +65,7 @@ type Payment = {
   member: string;
   description: string;
   category: string;
+  membership_months?: number | null;
   method: string;
   amount: number;
   status: string;
@@ -83,7 +84,8 @@ type Overview = {
   count: number;
   daily: { date: string; income: number; refund: number }[];
   categories: Record<string, number>;
-  items: Payment[];
+  items: (Payment & { expires_on?: string; refunded_amount?: number })[];
+  expired_memberships?: boolean;
   total: number;
   page: number;
   pages: number;
@@ -128,11 +130,15 @@ function App() {
     status: "",
     q: "",
     page: 1,
+    expired_memberships: "",
   });
+  const showExpired = filters.expired_memberships === "true";
   const [data, setData] = useState<Overview | null>(null),
     [loading, setLoading] = useState(false),
     [error, setError] = useState(""),
     [reload, setReload] = useState(0);
+  const listReady = showExpired === Boolean(data?.expired_memberships);
+  const listUnit = showExpired ? "hội viên" : "giao dịch";
   const [modal, setModal] = useState(false),
     [selected, setSelected] = useState<{
       payment: Payment;
@@ -143,6 +149,7 @@ function App() {
     [formError, setFormError] = useState("");
   const paymentKey = useRef(""),
     refundKey = useRef("");
+  const detailRequest = useRef(0);
   const query = new URLSearchParams(
     Object.entries(filters)
       .filter(([, value]) => value !== "")
@@ -222,18 +229,23 @@ function App() {
     }
   }
   async function openDetail(id: string) {
+    const request = ++detailRequest.current;
     setFormError("");
     try {
-      setSelected(await (await api("/transactions/" + id)).json());
+      const response = await api("/transactions/" + id, { cache: "no-store" });
+      const detail = await response.json();
+      if (request !== detailRequest.current) return;
+      setSelected(detail);
       refundKey.current = crypto.randomUUID();
     } catch (e) {
-      setError((e as Error).message);
+      if (request === detailRequest.current) setError((e as Error).message);
     }
   }
   async function save(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const form = new FormData(e.currentTarget);
     const occurredAt = String(form.get("occurred_at") ?? "");
+    const months = form.get("membership_months");
     if (!occurredAt) {
       setFormError("Chọn ngày, giờ và phút của khoản thu.");
       return;
@@ -244,6 +256,7 @@ function App() {
       const payload = {
         ...Object.fromEntries(form),
         amount: parseMoneyInput(form.get("amount")),
+        membership_months: months ? Number(months) : undefined,
         occurred_at: new Date(occurredAt + "+07:00").toISOString(),
         idempotency_key: paymentKey.current,
       };
@@ -462,6 +475,7 @@ function App() {
                   status: "",
                   q: "",
                   page: 1,
+                  expired_memberships: "",
                 })
               }
             >
@@ -577,21 +591,27 @@ function App() {
                   <div className="table-heading">
                     <div>
                       <h2 className="title-1">
-                        Lịch sử giao dịch{" "}
-                        <span className="total-badge">{data.total}</span>
+                        {showExpired ? "Hội viên hết hạn" : "Lịch sử giao dịch"}{" "}
+                        {listReady && (
+                          <span className="total-badge">{data.total}</span>
+                        )}
                       </h2>
                       <p className="muted text-sm mt-1">
-                        Quản lý từng khoản thu của trung tâm.
+                        {showExpired
+                          ? "Ngày hết hạn tính từ thời điểm giao dịch cộng số tháng của gói."
+                          : "Quản lý từng khoản thu của trung tâm."}
                       </p>
                     </div>
                   </div>
                   <div className="table-tools">
-                    <DateRange
-                      from={filters.from}
-                      to={filters.to}
-                      onChange={change}
-                      labelSuffix=" giao dịch"
-                    />
+                    {!showExpired && (
+                      <DateRange
+                        from={filters.from}
+                        to={filters.to}
+                        onChange={change}
+                        labelSuffix=" giao dịch"
+                      />
+                    )}
                     <div className="search">
                       <MagnifyingGlass size={18} className="shrink-0" />
                       <input
@@ -601,14 +621,27 @@ function App() {
                         onChange={(e) => change("q", e.target.value)}
                       />
                     </div>
-                    <Select
-                      label="Trạng thái"
-                      value={filters.status}
-                      onChange={(v) => change("status", v)}
-                      options={statuses}
-                    />
+                    <div className="flex flex-wrap items-center gap-3">
+                      <Select
+                        label="Trạng thái"
+                        value={showExpired ? "paid" : filters.status}
+                        onChange={(v) => change("status", v)}
+                        options={statuses}
+                        disabled={showExpired}
+                      />
+                      <button
+                        type="button"
+                        aria-pressed={showExpired}
+                        className={showExpired ? "primary" : undefined}
+                        onClick={() => change("expired_memberships", showExpired ? "" : "true")}
+                      >
+                        Hội viên hết hạn
+                      </button>
+                    </div>
                   </div>
-                  {data.items.length ? (
+                  {!listReady ? (
+                    loading && <div className="skeleton" aria-label="Đang tải danh sách" />
+                  ) : data.items.length ? (
                     <>
                       <div className="table-scroll">
                         <table>
@@ -616,7 +649,7 @@ function App() {
                             <tr>
                               <th>Giao dịch / Hội viên</th>
                               <th>Nguồn thu</th>
-                              <th>Thời điểm</th>
+                              <th>{showExpired ? "Ngày hết hạn" : "Thời điểm"}</th>
                               <th>Phương thức</th>
                               <th>Trạng thái</th>
                               <th className="amount">Số tiền</th>
@@ -636,7 +669,7 @@ function App() {
                                   </button>
                                 </td>
                                 <td>{categories[p.category]}</td>
-                                <td>{date(p.occurred_at)}</td>
+                                <td>{p.expires_on ? p.expires_on.split("-").reverse().join("/") : date(p.occurred_at)}</td>
                                 <td>{methods[p.method]}</td>
                                 <td>
                                   <span className={"badge " + p.status}>
@@ -651,7 +684,7 @@ function App() {
                                   </span>
                                 </td>
                                 <td className="amount">
-                                  <strong>{money(p.amount)}</strong>
+                                  <TransactionAmount amount={p.amount} refunded={p.refunded_amount} />
                                 </td>
                               </tr>
                             ))}
@@ -667,15 +700,15 @@ function App() {
                           >
                             <span className="flex justify-between gap-3">
                               <strong>{p.member}</strong>
-                              <strong className="shrink-0 tabular-nums">
-                                {money(p.amount)}
-                              </strong>
+                              <span className="shrink-0 text-right tabular-nums">
+                                <TransactionAmount amount={p.amount} refunded={p.refunded_amount} />
+                              </span>
                             </span>
                             <span className="muted">{p.description}</span>
                             <span className="muted text-xs">{categories[p.category]}</span>
                             <span className="flex justify-between gap-2 items-center">
                               <span className="muted text-xs">
-                                {date(p.occurred_at)}
+                                {p.expires_on ? `Hết hạn ${p.expires_on.split("-").reverse().join("/")}` : date(p.occurred_at)}
                                 <br />
                                 {methods[p.method]}
                               </span>
@@ -691,17 +724,17 @@ function App() {
                   ) : (
                     <div className="empty">
                       <Receipt size={36} />
-                      <h3 className="title-2">Chưa có giao dịch phù hợp</h3>
-                      <p className="muted">
-                        Thử thay đổi bộ lọc hoặc ghi nhận khoản thu đầu tiên.
-                      </p>
+                      <h3 className="title-2">{showExpired ? "Không có hội viên hết hạn phù hợp" : "Chưa có giao dịch phù hợp"}</h3>
+                      {!showExpired && (
+                        <p className="muted">Thử thay đổi bộ lọc hoặc ghi nhận khoản thu đầu tiên.</p>
+                      )}
                     </div>
                   )}
-                  <div className="pagination">
+                  {listReady && <div className="pagination">
                     <span className="muted">
                       {data.total
-                        ? `${(data.page - 1) * 10 + 1}–${Math.min(data.page * 10, data.total)} trong ${data.total} giao dịch`
-                        : "0 giao dịch"}
+                        ? `${(data.page - 1) * 10 + 1}–${Math.min(data.page * 10, data.total)} trong ${data.total} ${listUnit}`
+                        : `0 ${listUnit}`}
                     </span>
                     <div>
                       <button
@@ -726,7 +759,7 @@ function App() {
                         <CaretRight />
                       </button>
                     </div>
-                  </div>
+                  </div>}
                 </section>
               </div>
             )
@@ -760,16 +793,7 @@ function App() {
                   placeholder="Họ và tên hội viên"
                 />
               </label>
-              <label>
-                Nguồn thu
-                <select name="category">
-                  {Object.entries(categories).map(([k, v]) => (
-                    <option key={k} value={k}>
-                      {v}
-                    </option>
-                  ))}
-                </select>
-              </label>
+              <IncomeSourceFields />
               <label className="full">
                 Nội dung
                 <input
@@ -847,6 +871,16 @@ function App() {
                 <dd>{v}</dd>
               </div>
             ))}
+            {selected.payment.category === "membership" && (
+              <div>
+                <dt>Tổng tháng</dt>
+                <dd>
+                  {selected.payment.membership_months == null
+                    ? "Chưa nhập cho giao dịch này"
+                    : `${selected.payment.membership_months} tháng`}
+                </dd>
+              </div>
+            )}
           </dl>
           {selected.refunds.map((r) => (
             <div className="refund-entry" key={r.id}>
@@ -897,6 +931,64 @@ function App() {
     </>
   );
 }
+function TransactionAmount({ amount, refunded = 0 }: { amount: number; refunded?: number }) {
+  return (
+    <>
+      <strong>{money(amount)}</strong>
+      {refunded > 0 && <span className="muted block text-xs">Đã hoàn {money(refunded)}</span>}
+    </>
+  );
+}
+
+const membershipMonthPresets = ["1", "3", "6", "12"];
+
+function IncomeSourceFields() {
+  const [category, setCategory] = useState("membership");
+  const [months, setMonths] = useState("");
+  return (
+    <>
+      <label>
+        Nguồn thu
+        <select name="category" value={category} onChange={(event) => setCategory(event.target.value)}>
+          {Object.entries(categories).map(([key, label]) => (
+            <option key={key} value={key}>{label}</option>
+          ))}
+        </select>
+      </label>
+      {category === "membership" && (
+        <>
+          <label>
+            Tổng tháng
+            <input
+              name="membership_months"
+              type="number"
+              min={1}
+              max={Number.MAX_SAFE_INTEGER}
+              step={1}
+              inputMode="numeric"
+              value={months}
+              onChange={(event) => setMonths(event.target.value)}
+              placeholder="Nhập số tháng"
+            />
+          </label>
+          <label>
+            Chọn nhanh số tháng
+            <select
+              value={membershipMonthPresets.includes(months) ? months : ""}
+              onChange={(event) => setMonths(event.target.value)}
+            >
+              <option value="">Chọn mốc có sẵn</option>
+              {membershipMonthPresets.map((value) => (
+                <option key={value} value={value}>{value} tháng</option>
+              ))}
+            </select>
+          </label>
+        </>
+      )}
+    </>
+  );
+}
+
 function Brand({ compact = false }: { compact?: boolean }) {
   return (
     <div className={"brand " + (compact ? "compact" : "")}>
@@ -954,15 +1046,18 @@ function Select({
   value,
   onChange,
   options,
+  disabled,
 }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
   options: Record<string, string>;
+  disabled?: boolean;
 }) {
   return (
     <select
       aria-label={label}
+      disabled={disabled}
       value={value}
       onChange={(e) => onChange(e.target.value)}
     >

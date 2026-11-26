@@ -136,6 +136,110 @@ async fn retries_do_not_duplicate_payments_or_audit() {
     assert_eq!(n, 1);
 }
 #[tokio::test]
+async fn membership_months_persist_and_participate_in_retries() {
+    let s = app().await;
+    let path = "/api/transactions";
+    let mut input = payment(
+        "membership-months-key",
+        "paid",
+        400000,
+        "2026-01-01T00:00:00Z",
+    );
+    input["membership_months"] = serde_json::json!(4);
+    let created = request(&s, "POST", path, input.clone()).await;
+    assert_eq!(created.0, StatusCode::OK);
+    assert_eq!(request(&s, "POST", path, input.clone()).await, created);
+    let detail_path = format!("{path}/{}", created.1["id"].as_str().unwrap());
+    let (_, detail) = request(&s, "GET", &detail_path, serde_json::Value::Null).await;
+    assert_eq!(detail["payment"]["membership_months"], 4);
+
+    input["membership_months"] = serde_json::json!(5);
+    assert_eq!(
+        request(&s, "POST", path, input.clone()).await.0,
+        StatusCode::CONFLICT
+    );
+    input["membership_months"] = serde_json::json!(0);
+    assert_eq!(
+        request(&s, "POST", path, input.clone()).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    input["category"] = serde_json::json!("daily");
+    input["membership_months"] = serde_json::json!(4);
+    assert_eq!(
+        request(&s, "POST", path, input).await.0,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn expired_memberships_use_calendar_months_and_ignore_old_renewed_packages() {
+    let s = app().await;
+    for (key, member, status, at, months) in [
+        (
+            "expiry-old",
+            "Hội viên hết hạn",
+            "paid",
+            "2024-01-30T18:00:00Z",
+            1,
+        ),
+        (
+            "expiry-renewal-old",
+            "Hội viên đã gia hạn",
+            "paid",
+            "2024-01-31T00:00:00Z",
+            1,
+        ),
+        (
+            "expiry-renewal-new",
+            "hội viên đã gia hạn",
+            "paid",
+            "2024-02-20T00:00:00Z",
+            12,
+        ),
+        (
+            "expiry-pending",
+            "Hội viên chờ",
+            "pending",
+            "2024-01-31T00:00:00Z",
+            1,
+        ),
+    ] {
+        let mut input = payment(key, status, 100000, at);
+        input["member"] = serde_json::json!(member);
+        input["membership_months"] = serde_json::json!(months);
+        assert_eq!(
+            request(&s, "POST", "/api/transactions", input).await.0,
+            StatusCode::OK
+        );
+    }
+
+    let february_28 = NaiveDate::from_ymd_opt(2024, 2, 28).unwrap();
+    let february_29 = NaiveDate::from_ymd_opt(2024, 2, 29).unwrap();
+    assert!(
+        expired_memberships(&s.db, None, february_28)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let expired = expired_memberships(&s.db, None, february_29).await.unwrap();
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].payment.member, "Hội viên hết hạn");
+    assert_eq!(expired[0].expires_on, Some(february_29));
+
+    let (_, overview) = request(
+        &s,
+        "GET",
+        "/api/overview?expired_memberships=true&from=2026-01-01&status=pending&q=gia",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(overview["expired_memberships"], true);
+    assert_eq!(overview["gross"], 0);
+    assert_eq!(overview["total"], 1);
+    assert_eq!(overview["items"][0]["expires_on"], "2025-02-20");
+}
+
+#[tokio::test]
 async fn partial_refund_retry_over_refund_and_cross_period() {
     let s = app().await;
     let (_, p) = request(
@@ -177,6 +281,15 @@ async fn partial_refund_retry_over_refund_and_cross_period() {
     assert_eq!(v["refunded"], 300000);
     assert_eq!(v["net"], -300000);
     assert_eq!(request(&s,"POST",&path,serde_json::json!({"amount":600000,"reason":"Hoàn phần còn lại","idempotency_key":"remaining-refund-key"})).await.0,StatusCode::OK);
+    let (_, original_period) = request(
+        &s,
+        "GET",
+        "/api/overview?from=2026-01-01&to=2026-01-01",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(original_period["refunded"], 0);
+    assert_eq!(original_period["items"][0]["refunded_amount"], 900000);
 }
 #[tokio::test]
 async fn reject_invalid_amount_dates_and_unauthenticated_requests() {
